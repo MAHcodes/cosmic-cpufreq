@@ -3,11 +3,18 @@
 A COSMIC applet for inspecting and changing CPU frequency scaling settings on Linux.
 
 Features:
-- show current average CPU frequency in the panel
+- show current average CPU frequency in the panel (icon and/or text)
 - toggle turbo boost
 - change CPU governor
 - change energy performance preference when available
 - adjust minimum and maximum scaling frequency
+- tabbed popup: a clean Controls view plus a Details view for system info, per-core frequencies and usage bars
+- selectable popup layout: tabbed, single horizontal (info beside controls) or single vertical (info above controls)
+- configurable panel display (average/min/max), frequency unit and decimal precision
+- system information shown in a System section in the settings page
+- per-block visibility toggles for the per-core grid, CPU and memory usage
+- configurable per-core grid columns and separate min/max frequency slider toggles
+- restore saved turbo/governor settings on launch (toggleable)
 
 ![cosmic-cpufreq-image](img.png)
 
@@ -73,7 +80,7 @@ This is intentional: slider limits should match frequencies the kernel will actu
 
 - Governor and EPP controls only appear when the corresponding sysfs interfaces are available.
 - Frequency sliders update on release, not continuously while dragging.
-- The panel text shows the average current frequency across available cpufreq policies.
+- The panel text shows the current CPU frequency (average by default; minimum/maximum selectable).
 
 ## Uninstall
 

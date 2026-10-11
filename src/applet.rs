@@ -3,9 +3,15 @@ use std::time::Duration;
 use tracing::{debug, trace};
 
 use crate::{
-    config::{APP_ID, CpuFreqConfig, Flags, FreqDisplayMode},
+    config::{APP_ID, CpuFreqConfig, Flags, FreqDisplayMode, FreqUnit, PopupLayout},
     cpu, fl,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MainTab {
+    Controls,
+    Details,
+}
 
 pub(crate) fn run() -> cosmic::iced::Result {
     cosmic::applet::run::<CpuFreqApplet>(Flags::new())
@@ -13,6 +19,8 @@ pub(crate) fn run() -> cosmic::iced::Result {
 
 const DEFAULT_POPUP_WIDTH: f32 = 360.0;
 const HORIZONTAL_POPUP_WIDTH: f32 = 600.0;
+/// Fixed width reserved for the panel frequency text so it never changes width.
+const PANEL_TEXT_WIDTH: f32 = 64.0;
 
 struct CpuFreqApplet {
     core: cosmic::app::Core,
@@ -35,6 +43,8 @@ struct CpuFreqApplet {
     preview_max_mhz: Option<f64>,
     update_interval_input: String,
     show_settings: bool,
+    // Tab model for the main popup (Controls / Details)
+    main_tab_model: cosmic::widget::segmented_button::SingleSelectModel,
     // System info (static, read once)
     cpu_model: Option<String>,
     machine_vendor: Option<String>,
@@ -50,16 +60,20 @@ struct CpuFreqApplet {
     memory_total_kb: Option<u64>,
     // Dropdown options stored to satisfy borrow lifetime
     display_mode_options: Vec<String>,
+    freq_unit_options: Vec<String>,
+    precision_options: Vec<String>,
+    columns_options: Vec<String>,
     layout_options: Vec<String>,
     governor_labels: Vec<String>,
     epp_labels: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) enum Message {
     Tick,
     ToggleWindow,
     PopupClosed(cosmic::iced::window::Id),
+    Surface(cosmic::surface::Action),
     SetTurbo(bool),
     SetGovernor(usize),
     SetEpp(usize),
@@ -71,11 +85,21 @@ pub(crate) enum Message {
     CommitScalingMax,
     UpdateIntervalChanged(String),
     ToggleSettings,
+    MainTabActivated(cosmic::widget::segmented_button::Entity),
     SetFreqDisplayMode(usize),
+    SetFreqUnit(usize),
+    SetFreqPrecision(usize),
+    SetPerCoreColumns(usize),
+    SetLayout(usize),
+    SetShowPanelIcon(bool),
+    SetShowPanelText(bool),
+    SetShowPerCoreFreqs(bool),
     SetShowPerCoreUsage(bool),
     SetShowCpuUsage(bool),
     SetShowMemoryUsage(bool),
-    SetLayout(usize),
+    SetShowMinFrequencySlider(bool),
+    SetShowMaxFrequencySlider(bool),
+    SetRestoreOnStart(bool),
 }
 
 impl cosmic::Application for CpuFreqApplet {
@@ -110,6 +134,12 @@ impl cosmic::Application for CpuFreqApplet {
         let os_name = cpu::read_os_name();
         let kernel_version = cpu::read_kernel_version();
 
+        let mut main_tab_model = cosmic::widget::segmented_button::Model::builder()
+            .insert(|b| b.text(fl!("tab-controls")).data(MainTab::Controls))
+            .insert(|b| b.text(fl!("tab-details")).data(MainTab::Details))
+            .build();
+        main_tab_model.activate_position(0);
+
         let mut applet = Self {
             core,
             popup: None,
@@ -128,6 +158,7 @@ impl cosmic::Application for CpuFreqApplet {
             preview_max_mhz: None,
             update_interval_input,
             show_settings: false,
+            main_tab_model,
             cpu_model,
             machine_vendor,
             machine_model,
@@ -144,15 +175,28 @@ impl cosmic::Application for CpuFreqApplet {
                 fl!("display-minimum"),
                 fl!("display-maximum"),
             ],
-            layout_options: vec![fl!("layout-horizontal"), fl!("layout-vertical")],
+            freq_unit_options: vec![fl!("unit-auto"), fl!("unit-ghz"), fl!("unit-mhz")],
+            precision_options: (0..=3).map(|p| p.to_string()).collect(),
+            columns_options: ["2", "3", "4", "6", "8"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            layout_options: vec![
+                fl!("layout-tabbed"),
+                fl!("layout-horizontal"),
+                fl!("layout-vertical"),
+            ],
             governor_labels: Vec::new(),
             epp_labels: Vec::new(),
         };
 
         applet.rebuild_labels();
 
-        // Restore saved turbo setting if the system state differs
-        applet.restore_turbo_setting();
+        // Restore saved settings if the system state differs
+        if applet.config.restore_settings_on_start {
+            applet.restore_turbo_setting();
+            applet.restore_governor_setting();
+        }
 
         (applet, cosmic::task::none())
     }
@@ -203,7 +247,8 @@ impl cosmic::Application for CpuFreqApplet {
                 };
                 let system_turbo = cpu::read_turbo_enabled();
                 // If turbo was changed externally, restore our saved setting
-                if system_turbo != Some(self.config.turbo_enabled)
+                if self.config.restore_settings_on_start
+                    && system_turbo != Some(self.config.turbo_enabled)
                     && self.turbo_enabled == Some(self.config.turbo_enabled)
                     && system_turbo != self.turbo_enabled
                 {
@@ -312,6 +357,11 @@ impl cosmic::Application for CpuFreqApplet {
                         tracing::error!("Failed to set governor: {e}");
                     } else {
                         self.current_governor = Some(gov.clone());
+                        if let Some(handler) = &self.config_handler
+                            && let Err(error) = self.config.set_saved_governor(handler, gov.clone())
+                        {
+                            tracing::error!("Failed to save governor config: {error}");
+                        }
                     }
                 }
             }
@@ -355,8 +405,7 @@ impl cosmic::Application for CpuFreqApplet {
                 if let Ok(ms) = value.parse::<u64>() {
                     if ms >= 100 {
                         if let Some(handler) = &self.config_handler
-                            && let Err(error) =
-                                self.config.set_update_interval_ms(handler, ms)
+                            && let Err(error) = self.config.set_update_interval_ms(handler, ms)
                         {
                             tracing::error!("Failed to save update interval: {error}");
                         }
@@ -365,6 +414,9 @@ impl cosmic::Application for CpuFreqApplet {
             }
             Message::ToggleSettings => {
                 self.show_settings = !self.show_settings;
+            }
+            Message::MainTabActivated(id) => {
+                self.main_tab_model.activate(id);
             }
             Message::SetFreqDisplayMode(idx) => {
                 let mode = match idx {
@@ -378,10 +430,77 @@ impl cosmic::Application for CpuFreqApplet {
                     tracing::error!("Failed to save display mode: {error}");
                 }
             }
+            Message::SetFreqUnit(idx) => {
+                let unit = match idx {
+                    1 => FreqUnit::Gigahertz,
+                    2 => FreqUnit::Megahertz,
+                    _ => FreqUnit::Auto,
+                };
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) = self.config.set_freq_unit(handler, unit)
+                {
+                    tracing::error!("Failed to save frequency unit: {error}");
+                }
+            }
+            Message::SetFreqPrecision(idx) => {
+                let precision = idx.clamp(0, 3) as u32;
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) = self.config.set_freq_precision(handler, precision)
+                {
+                    tracing::error!("Failed to save frequency precision: {error}");
+                }
+            }
+            Message::SetPerCoreColumns(idx) => {
+                let columns = match idx {
+                    0 => 2,
+                    1 => 3,
+                    2 => 4,
+                    3 => 6,
+                    4 => 8,
+                    _ => 4,
+                };
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) = self.config.set_per_core_columns(handler, columns)
+                {
+                    tracing::error!("Failed to save per-core columns: {error}");
+                }
+            }
+            Message::SetLayout(idx) => {
+                let layout = match idx {
+                    1 => PopupLayout::Horizontal,
+                    2 => PopupLayout::Vertical,
+                    _ => PopupLayout::Tabbed,
+                };
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) = self.config.set_popup_layout(handler, layout)
+                {
+                    tracing::error!("Failed to save popup layout: {error}");
+                }
+            }
+            Message::SetShowPanelIcon(enabled) => {
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) = self.config.set_show_panel_icon(handler, enabled)
+                {
+                    tracing::error!("Failed to save panel icon setting: {error}");
+                }
+            }
+            Message::SetShowPanelText(enabled) => {
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) = self.config.set_show_panel_text(handler, enabled)
+                {
+                    tracing::error!("Failed to save panel text setting: {error}");
+                }
+            }
+            Message::SetShowPerCoreFreqs(enabled) => {
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) = self.config.set_show_per_core_freqs(handler, enabled)
+                {
+                    tracing::error!("Failed to save per-core freq setting: {error}");
+                }
+            }
             Message::SetShowPerCoreUsage(enabled) => {
                 if let Some(handler) = &self.config_handler
-                    && let Err(error) =
-                        self.config.set_show_per_core_usage(handler, enabled)
+                    && let Err(error) = self.config.set_show_per_core_usage(handler, enabled)
                 {
                     tracing::error!("Failed to save per-core usage setting: {error}");
                 }
@@ -400,13 +519,33 @@ impl cosmic::Application for CpuFreqApplet {
                     tracing::error!("Failed to save memory usage setting: {error}");
                 }
             }
-            Message::SetLayout(idx) => {
-                let enabled = idx == 0;
+            Message::SetShowMinFrequencySlider(enabled) => {
                 if let Some(handler) = &self.config_handler
-                    && let Err(error) = self.config.set_horizontal_layout(handler, enabled)
+                    && let Err(error) =
+                        self.config.set_show_min_frequency_slider(handler, enabled)
                 {
-                    tracing::error!("Failed to save layout setting: {error}");
+                    tracing::error!("Failed to save min frequency slider setting: {error}");
                 }
+            }
+            Message::SetShowMaxFrequencySlider(enabled) => {
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) =
+                        self.config.set_show_max_frequency_slider(handler, enabled)
+                {
+                    tracing::error!("Failed to save max frequency slider setting: {error}");
+                }
+            }
+            Message::SetRestoreOnStart(enabled) => {
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) = self.config.set_restore_settings_on_start(handler, enabled)
+                {
+                    tracing::error!("Failed to save restore-on-start setting: {error}");
+                }
+            }
+            Message::Surface(action) => {
+                return cosmic::task::message(cosmic::Action::Cosmic(
+                    cosmic::app::Action::Surface(action),
+                ));
             }
         }
 
@@ -414,13 +553,31 @@ impl cosmic::Application for CpuFreqApplet {
     }
 
     fn view(&self) -> cosmic::Element<'_, Message> {
-        let freq_text = match self.current_freq_mhz {
-            Some(mhz) if mhz >= 1000.0 => format!("{:.2} GHz", mhz / 1000.0),
-            Some(mhz) => format!("{:.0} MHz", mhz),
-            None => "--".to_string(),
-        };
+        // Fixed width so the panel button does not resize as the text changes.
+        let freq_text = cosmic::widget::container(
+            cosmic::widget::text(self.format_freq(self.current_freq_mhz)).size(12),
+        )
+        .center_x(cosmic::iced::Length::Fixed(PANEL_TEXT_WIDTH));
 
-        let content = cosmic::widget::text(freq_text).size(12);
+        let show_icon = self.config.show_panel_icon;
+        let show_text = self.config.show_panel_text;
+
+        let content: cosmic::Element<'_, Message> = if show_icon && show_text {
+            cosmic::iced_widget::row![
+                cosmic::widget::icon::from_name("utilities-system-monitor-symbolic").size(16),
+                freq_text,
+            ]
+            .spacing(6)
+            .align_y(cosmic::iced::Alignment::Center)
+            .into()
+        } else if show_icon {
+            cosmic::widget::icon::from_name("utilities-system-monitor-symbolic")
+                .size(16)
+                .into()
+        } else {
+            // Fall back to text even when disabled so the button is not empty
+            freq_text.into()
+        };
 
         let button = cosmic::widget::button::custom(content)
             .class(cosmic::theme::Button::AppletIcon)
@@ -430,151 +587,14 @@ impl cosmic::Application for CpuFreqApplet {
     }
 
     fn view_window(&self, _id: cosmic::iced::window::Id) -> cosmic::Element<'_, Message> {
-        let mut content = cosmic::iced_widget::column![].spacing(8);
-
-        if self.show_settings {
-            // ── Settings page ──
-            let header = cosmic::iced_widget::row![
-                cosmic::widget::button::icon(
-                    cosmic::widget::icon::from_name("go-previous-symbolic")
-                )
-                .on_press(Message::ToggleSettings),
-                cosmic::widget::text::title4(fl!("settings")),
-            ]
-            .spacing(8)
-            .align_y(cosmic::iced::Alignment::Center);
-            content = content.push(cosmic::applet::padded_control(header));
-
-            content = content.push(cosmic::applet::padded_control(
-                cosmic::widget::divider::horizontal::default(),
-            ));
-
-            // Display mode dropdown
-            let current_idx = match self.config.freq_display_mode {
-                FreqDisplayMode::Average => Some(0),
-                FreqDisplayMode::Minimum => Some(1),
-                FreqDisplayMode::Maximum => Some(2),
-            };
-            let mode_row = cosmic::iced_widget::column![
-                cosmic::widget::text::body(fl!("display-mode")),
-                cosmic::widget::dropdown(
-                    &self.display_mode_options,
-                    current_idx,
-                    Message::SetFreqDisplayMode,
-                ),
-            ]
-            .spacing(4);
-            content = content.push(cosmic::applet::padded_control(mode_row));
-
-            // Per-core usage toggle
-            let usage_row = cosmic::iced_widget::row![
-                cosmic::widget::text(fl!("show-per-core-usage")),
-                cosmic::widget::Space::new().width(cosmic::iced::Length::Fill),
-                cosmic::widget::toggler(self.config.show_per_core_usage)
-                    .on_toggle(Message::SetShowPerCoreUsage),
-            ];
-            content = content.push(cosmic::applet::padded_control(usage_row));
-
-            // Show CPU usage toggle
-            let cpu_usage_row = cosmic::iced_widget::row![
-                cosmic::widget::text(fl!("show-cpu-usage")),
-                cosmic::widget::Space::new().width(cosmic::iced::Length::Fill),
-                cosmic::widget::toggler(self.config.show_cpu_usage)
-                    .on_toggle(Message::SetShowCpuUsage),
-            ];
-            content = content.push(cosmic::applet::padded_control(cpu_usage_row));
-
-            // Show memory usage toggle
-            let mem_usage_row = cosmic::iced_widget::row![
-                cosmic::widget::text(fl!("show-memory-usage")),
-                cosmic::widget::Space::new().width(cosmic::iced::Length::Fill),
-                cosmic::widget::toggler(self.config.show_memory_usage)
-                    .on_toggle(Message::SetShowMemoryUsage),
-            ];
-            content = content.push(cosmic::applet::padded_control(mem_usage_row));
-
-            let current_layout_idx = Some(if self.config.horizontal_layout { 0 } else { 1 });
-            let layout_row = cosmic::iced_widget::column![
-                cosmic::widget::text::body(fl!("layout")),
-                cosmic::widget::dropdown(
-                    &self.layout_options,
-                    current_layout_idx,
-                    Message::SetLayout,
-                ),
-            ];
-            let layout_row = layout_row.spacing(4);
-            content = content.push(cosmic::applet::padded_control(layout_row));
-
-            // Update interval input
-            let interval_row = cosmic::iced_widget::column![
-                cosmic::widget::text::body(fl!("update-interval")),
-                cosmic::widget::text_input("2000", &self.update_interval_input)
-                    .on_input(Message::UpdateIntervalChanged),
-            ]
-            .spacing(4);
-            content = content.push(cosmic::applet::padded_control(interval_row));
+        let content = if self.show_settings {
+            self.settings_view()
         } else {
-            // ── Main popup page ──
-
-            // System info header with settings cog (always at top)
-            let mut info_col = cosmic::iced_widget::column![].spacing(2);
-            if let Some(model) = &self.cpu_model {
-                info_col = info_col.push(cosmic::widget::text::body(model.clone()));
-            }
-            if let (Some(vendor), Some(model)) = (&self.machine_vendor, &self.machine_model) {
-                info_col = info_col.push(
-                    cosmic::widget::text::caption(format!("{vendor} {model}")),
-                );
-            }
-            if let Some(os) = &self.os_name {
-                info_col = info_col.push(cosmic::widget::text::caption(os.clone()));
-            }
-            if let Some(kern) = &self.kernel_version {
-                info_col = info_col.push(
-                    cosmic::widget::text::caption(format!("{} {kern}", fl!("kernel"))),
-                );
-            }
-
-            let header_row = cosmic::iced_widget::row![
-                info_col,
-                cosmic::widget::Space::new().width(cosmic::iced::Length::Fill),
-                cosmic::widget::button::icon(
-                    cosmic::widget::icon::from_name("emblem-system-symbolic")
-                )
-                .on_press(Message::ToggleSettings),
-            ]
-            .align_y(cosmic::iced::Alignment::Start);
-            content = content.push(cosmic::applet::padded_control(header_row));
-
-            let info_section = self.build_info_section();
-            let controls_section = self.build_controls_section();
-
-            if self.config.horizontal_layout {
-                let row = cosmic::iced_widget::row![
-                    cosmic::widget::container(info_section)
-                        .width(cosmic::iced::Length::FillPortion(1)),
-                    cosmic::widget::container(controls_section)
-                        .width(cosmic::iced::Length::FillPortion(1)),
-                ]
-                .spacing(16);
-                content = content.push(row);
-            } else {
-                content = content.push(info_section);
-                content = content.push(cosmic::applet::padded_control(
-                    cosmic::widget::divider::horizontal::default(),
-                ));
-                content = content.push(controls_section);
-            }
-        }
-
-        let data = content.padding([16, 0]);
-
-        let container = if !self.show_settings && self.config.horizontal_layout {
-            cosmic::widget::container(data)
-                .width(cosmic::iced::Length::Fixed(600.0))
-        } else {
-            cosmic::widget::container(data)
+            self.main_view()
         };
+
+        let container = cosmic::widget::container(content)
+            .padding(cosmic::iced::Padding::ZERO.top(8.0).bottom(8.0));
 
         self.core
             .applet
@@ -585,11 +605,289 @@ impl cosmic::Application for CpuFreqApplet {
 }
 
 impl CpuFreqApplet {
+    /// Main popup, dispatching to the configured layout.
+    fn main_view(&self) -> cosmic::Element<'_, Message> {
+        match self.config.popup_layout {
+            PopupLayout::Tabbed => self.tabbed_view(),
+            PopupLayout::Horizontal | PopupLayout::Vertical => self.single_view(),
+        }
+    }
+
+    /// The settings cog button shown in the top-right of the main popup.
+    fn settings_cog(&self) -> cosmic::Element<'_, Message> {
+        cosmic::widget::button::icon(cosmic::widget::icon::from_name("emblem-system-symbolic"))
+            .on_press(Message::ToggleSettings)
+            .padding(4)
+            .into()
+    }
+
+    /// Tabbed layout: compact header, Controls/Details tabs, active tab body.
+    fn tabbed_view(&self) -> cosmic::Element<'_, Message> {
+        let mut col = cosmic::iced_widget::column![].spacing(8);
+
+        // Header: current frequency prominent, settings cog on the right
+        let freq_col = cosmic::iced_widget::column![
+            cosmic::widget::text::caption(fl!("frequency")),
+            cosmic::widget::text::title3(self.format_freq(self.current_freq_mhz)),
+        ]
+        .spacing(2);
+        let header = cosmic::iced_widget::row![
+            freq_col,
+            cosmic::widget::Space::new().width(cosmic::iced::Length::Fill),
+            self.settings_cog(),
+        ]
+        .align_y(cosmic::iced::Alignment::Center);
+        col = col.push(cosmic::applet::padded_control(header));
+
+        // Tab switcher
+        let tabs = cosmic::widget::segmented_control::horizontal(&self.main_tab_model)
+            .on_activate(Message::MainTabActivated);
+        col = col.push(cosmic::applet::padded_control(tabs));
+
+        // Active tab body
+        match self
+            .main_tab_model
+            .data::<MainTab>(self.main_tab_model.active())
+            .copied()
+            .unwrap_or(MainTab::Controls)
+        {
+            MainTab::Controls => col = col.push(self.build_controls_section(false)),
+            MainTab::Details => col = col.push(self.build_details_section(false)),
+        }
+
+        col.into()
+    }
+
+    /// Single-page layout: compact frequency header, then info + controls.
+    /// Horizontal places the two sections side by side; Vertical stacks them.
+    fn single_view(&self) -> cosmic::Element<'_, Message> {
+        let mut col = cosmic::iced_widget::column![].spacing(8);
+
+        // Header: current frequency, settings cog on the right
+        let freq_col = cosmic::iced_widget::column![
+            cosmic::widget::text::caption(fl!("frequency")),
+            cosmic::widget::text::title3(self.format_freq(self.current_freq_mhz)),
+        ]
+        .spacing(2);
+        let header = cosmic::iced_widget::row![
+            freq_col,
+            cosmic::widget::Space::new().width(cosmic::iced::Length::Fill),
+            self.settings_cog(),
+        ]
+        .align_y(cosmic::iced::Alignment::Center);
+        col = col.push(cosmic::applet::padded_control(header));
+
+        col = col.push(cosmic::applet::padded_control(
+            cosmic::widget::divider::horizontal::default(),
+        ));
+
+        match self.config.popup_layout {
+            PopupLayout::Horizontal => {
+                // Compact columns (no inner horizontal padding); the outer inset
+                // is applied to each column so the middle gap is only `spacing`.
+                let info_section = cosmic::widget::container(self.build_details_section(true))
+                    .width(cosmic::iced::Length::FillPortion(1))
+                    .padding(cosmic::iced::Padding {
+                        top: 0.0,
+                        right: 0.0,
+                        bottom: 0.0,
+                        left: 12.0,
+                    });
+                let controls_section = cosmic::widget::container(self.build_controls_section(true))
+                    .width(cosmic::iced::Length::FillPortion(1))
+                    .padding(cosmic::iced::Padding {
+                        top: 0.0,
+                        right: 12.0,
+                        bottom: 0.0,
+                        left: 0.0,
+                    });
+                let body = cosmic::iced_widget::row![info_section, controls_section]
+                    .spacing(16)
+                    .align_y(cosmic::iced::Alignment::Start);
+                col = col.push(body);
+            }
+            _ => {
+                col = col.push(
+                    cosmic::widget::container(self.build_details_section(false))
+                        .width(cosmic::iced::Length::FillPortion(1)),
+                );
+                col = col.push(cosmic::applet::padded_control(
+                    cosmic::widget::divider::horizontal::default(),
+                ));
+                col = col.push(
+                    cosmic::widget::container(self.build_controls_section(false))
+                        .width(cosmic::iced::Length::FillPortion(1)),
+                );
+            }
+        }
+
+        col.into()
+    }
+
+    /// Settings page with grouped sections.
+    fn settings_view(&self) -> cosmic::Element<'_, Message> {
+        let mut col = cosmic::iced_widget::column![].spacing(8);
+
+        let header = cosmic::iced_widget::row![
+            cosmic::widget::button::icon(cosmic::widget::icon::from_name("go-previous-symbolic"))
+                .on_press(Message::ToggleSettings)
+                .padding(4),
+            cosmic::widget::text::title4(fl!("settings")),
+            cosmic::widget::Space::new().width(cosmic::iced::Length::Fill),
+        ]
+        .spacing(8)
+        .align_y(cosmic::iced::Alignment::Center);
+        col = col.push(cosmic::applet::padded_control(header));
+
+        col = col.push(cosmic::applet::padded_control(
+            cosmic::widget::divider::horizontal::default(),
+        ));
+
+        let body = cosmic::widget::scrollable(self.settings_sections())
+            .height(cosmic::iced::Length::Fixed(500.0));
+        col = col.push(cosmic::applet::padded_control(body));
+
+        col.into()
+    }
+
+    fn settings_sections(&self) -> cosmic::Element<'_, Message> {
+        use cosmic::widget::settings;
+
+        let display_mode_idx = match self.config.freq_display_mode {
+            FreqDisplayMode::Average => Some(0),
+            FreqDisplayMode::Minimum => Some(1),
+            FreqDisplayMode::Maximum => Some(2),
+        };
+        let freq_unit_idx = match self.config.freq_unit {
+            FreqUnit::Auto => Some(0),
+            FreqUnit::Gigahertz => Some(1),
+            FreqUnit::Megahertz => Some(2),
+        };
+        let precision_idx = Some(self.config.freq_precision.clamp(0, 3) as usize);
+        let layout_idx = match self.config.popup_layout {
+            PopupLayout::Tabbed => Some(0),
+            PopupLayout::Horizontal => Some(1),
+            PopupLayout::Vertical => Some(2),
+        };
+        let columns_idx = match self.config.per_core_columns {
+            2 => Some(0),
+            3 => Some(1),
+            6 => Some(3),
+            8 => Some(4),
+            _ => Some(2),
+        };
+
+        let panel = settings::section()
+            .title(fl!("panel-section"))
+            .add(
+                settings::item::builder(fl!("show-panel-icon"))
+                    .toggler(self.config.show_panel_icon, Message::SetShowPanelIcon),
+            )
+            .add(
+                settings::item::builder(fl!("show-panel-text"))
+                    .toggler(self.config.show_panel_text, Message::SetShowPanelText),
+            )
+            .add(
+                settings::item::builder(fl!("display-mode")).control(self.popup_dropdown(
+                    &self.display_mode_options,
+                    display_mode_idx,
+                    Message::SetFreqDisplayMode,
+                )),
+            )
+            .add(
+                settings::item::builder(fl!("frequency-unit")).control(self.popup_dropdown(
+                    &self.freq_unit_options,
+                    freq_unit_idx,
+                    Message::SetFreqUnit,
+                )),
+            )
+            .add(
+                settings::item::builder(fl!("precision")).control(self.popup_dropdown(
+                    &self.precision_options,
+                    precision_idx,
+                    Message::SetFreqPrecision,
+                )),
+            )
+            .add(
+                settings::item::builder(fl!("popup-layout")).control(self.popup_dropdown(
+                    &self.layout_options,
+                    layout_idx,
+                    Message::SetLayout,
+                )),
+            );
+
+        let details = settings::section()
+            .title(fl!("details-section"))
+            .add(settings::item::builder(fl!("show-per-core-freqs")).toggler(
+                self.config.show_per_core_freqs,
+                Message::SetShowPerCoreFreqs,
+            ))
+            .add(settings::item::builder(fl!("per-core-columns")).control(
+                self.popup_dropdown(
+                    &self.columns_options,
+                    columns_idx,
+                    Message::SetPerCoreColumns,
+                ),
+            ))
+            .add(settings::item::builder(fl!("show-per-core-usage")).toggler(
+                self.config.show_per_core_usage,
+                Message::SetShowPerCoreUsage,
+            ))
+            .add(
+                settings::item::builder(fl!("show-cpu-usage"))
+                    .toggler(self.config.show_cpu_usage, Message::SetShowCpuUsage),
+            )
+            .add(
+                settings::item::builder(fl!("show-memory-usage"))
+                    .toggler(self.config.show_memory_usage, Message::SetShowMemoryUsage),
+            );
+
+        let controls = settings::section()
+            .title(fl!("controls-section"))
+            .add(
+                settings::item::builder(fl!("show-min-frequency-slider")).toggler(
+                    self.config.show_min_frequency_slider,
+                    Message::SetShowMinFrequencySlider,
+                ),
+            )
+            .add(
+                settings::item::builder(fl!("show-max-frequency-slider")).toggler(
+                    self.config.show_max_frequency_slider,
+                    Message::SetShowMaxFrequencySlider,
+                ),
+            );
+
+        let behavior = settings::section()
+            .title(fl!("behavior-section"))
+            .add(settings::item::builder(fl!("restore-on-start")).toggler(
+                self.config.restore_settings_on_start,
+                Message::SetRestoreOnStart,
+            ))
+            .add(
+                settings::item::builder(fl!("update-interval")).control(
+                    cosmic::widget::text_input("2000", &self.update_interval_input)
+                        .on_input(Message::UpdateIntervalChanged),
+                ),
+            );
+
+        let system = settings::section()
+            .title(fl!("system-section"))
+            .add(self.system_info_element());
+
+        settings::view_column(vec![
+            panel.into(),
+            details.into(),
+            controls.into(),
+            behavior.into(),
+            system.into(),
+        ])
+        .into()
+    }
+
     fn popup_width(&self) -> f32 {
-        if !self.show_settings && self.config.horizontal_layout {
-            HORIZONTAL_POPUP_WIDTH
-        } else {
-            DEFAULT_POPUP_WIDTH
+        match self.config.popup_layout {
+            PopupLayout::Horizontal => HORIZONTAL_POPUP_WIDTH,
+            _ => DEFAULT_POPUP_WIDTH,
         }
     }
 
@@ -599,7 +897,29 @@ impl CpuFreqApplet {
             .min_height(1.0)
             .min_width(width)
             .max_width(width)
-            .max_height(1080.0)
+            .max_height(1000.0)
+    }
+
+    /// Format a frequency value according to the configured unit and precision.
+    fn format_freq(&self, mhz: Option<f64>) -> String {
+        match self.config.freq_unit {
+            FreqUnit::Megahertz => mhz
+                .map(|m| format!("{:.0} MHz", m))
+                .unwrap_or_else(|| "--".to_string()),
+            FreqUnit::Gigahertz => mhz
+                .map(|m| Self::format_ghz(m, self.config.freq_precision))
+                .unwrap_or_else(|| "--".to_string()),
+            FreqUnit::Auto => match mhz {
+                Some(m) if m >= 1000.0 => Self::format_ghz(m, self.config.freq_precision),
+                Some(m) => format!("{:.0} MHz", m),
+                None => "--".to_string(),
+            },
+        }
+    }
+
+    fn format_ghz(mhz: f64, precision: u32) -> String {
+        let prec = precision.min(3) as usize;
+        format!("{:.prec$} GHz", mhz / 1000.0, prec = prec)
     }
 
     /// Restore saved turbo setting if system state differs from config.
@@ -618,6 +938,28 @@ impl CpuFreqApplet {
         }
     }
 
+    /// Restore saved governor if the system state differs from config.
+    fn restore_governor_setting(&mut self) {
+        if self.config.saved_governor.is_empty() {
+            return;
+        }
+        if self
+            .available_governors
+            .iter()
+            .any(|g| g == &self.config.saved_governor)
+            && self.current_governor.as_deref() != Some(self.config.saved_governor.as_str())
+        {
+            tracing::info!(
+                "Restoring governor: {} (system was: {:?})",
+                self.config.saved_governor,
+                self.current_governor
+            );
+            if cpu::write_governor(&self.config.saved_governor).is_ok() {
+                self.current_governor = Some(self.config.saved_governor.clone());
+            }
+        }
+    }
+
     /// Rebuild pretty display labels for governor and EPP dropdowns.
     fn rebuild_labels(&mut self) {
         self.governor_labels = self
@@ -632,23 +974,40 @@ impl CpuFreqApplet {
             .collect();
     }
 
-    /// Build the info section (per-core grid, usage bars).
-    fn build_info_section(&self) -> cosmic::Element<'_, Message> {
-        let mut col = cosmic::iced_widget::column![].spacing(8);
+    /// System information block (CPU model, machine, OS, kernel).
+    fn system_info_element(&self) -> cosmic::Element<'_, Message> {
+        let mut info_col = cosmic::iced_widget::column![].spacing(2);
+        if let Some(model) = &self.cpu_model {
+            info_col = info_col.push(cosmic::widget::text::body(model.clone()));
+        }
+        if let (Some(vendor), Some(model)) = (&self.machine_vendor, &self.machine_model) {
+            info_col = info_col.push(cosmic::widget::text::caption(format!("{vendor} {model}")));
+        }
+        if let Some(os) = &self.os_name {
+            info_col = info_col.push(cosmic::widget::text::caption(os.clone()));
+        }
+        if let Some(kern) = &self.kernel_version {
+            info_col = info_col.push(cosmic::widget::text::caption(format!(
+                "{} {kern}",
+                fl!("kernel")
+            )));
+        }
+        info_col.into()
+    }
+
+    /// Live info blocks (per-core grid, CPU usage, memory usage) as elements.
+    fn info_block_elements(&self) -> Vec<cosmic::Element<'_, Message>> {
+        let mut elements = Vec::new();
 
         // Per-core frequency grid
-        if !self.per_core_freqs.is_empty() {
-            let cols = 4usize;
+        if self.config.show_per_core_freqs && !self.per_core_freqs.is_empty() {
+            let cols = self.config.per_core_columns.clamp(1, 16) as usize;
             let mut grid_col = cosmic::iced_widget::column![].spacing(6);
 
             for (chunk_idx, chunk) in self.per_core_freqs.chunks(cols).enumerate() {
                 let mut row = cosmic::iced_widget::row![].spacing(8);
                 for (i, (id, mhz)) in chunk.iter().enumerate() {
-                    let freq_str = if *mhz >= 1000.0 {
-                        format!("{:.2} GHz", mhz / 1000.0)
-                    } else {
-                        format!("{:.0} MHz", mhz)
-                    };
+                    let freq_str = self.format_freq(Some(*mhz));
                     let mut cell = cosmic::iced_widget::column![
                         cosmic::widget::text(format!("CPU{id}")).size(11),
                         cosmic::widget::text(freq_str).size(13),
@@ -670,13 +1029,12 @@ impl CpuFreqApplet {
                 }
                 for _ in chunk.len()..cols {
                     row = row.push(
-                        cosmic::widget::Space::new()
-                            .width(cosmic::iced::Length::FillPortion(1)),
+                        cosmic::widget::Space::new().width(cosmic::iced::Length::FillPortion(1)),
                     );
                 }
                 grid_col = grid_col.push(row);
             }
-            col = col.push(cosmic::applet::padded_control(grid_col));
+            elements.push(grid_col.into());
         }
 
         // CPU usage bar
@@ -692,7 +1050,7 @@ impl CpuFreqApplet {
                 cosmic::widget::progress_bar(0.0..=100.0, pct as f32),
             ]
             .spacing(4);
-            col = col.push(cosmic::applet::padded_control(bar_row));
+            elements.push(bar_row.into());
         }
 
         // Memory usage bar
@@ -714,24 +1072,63 @@ impl CpuFreqApplet {
                 cosmic::widget::progress_bar(0.0..=100.0, pct as f32),
             ]
             .spacing(4);
-            col = col.push(cosmic::applet::padded_control(bar_row));
+            elements.push(bar_row.into());
+        }
+
+        elements
+    }
+
+    /// Build the Details tab (per-core grid, usage bars).
+    ///
+    /// `compact` drops the horizontal row padding so the caller can supply the
+    /// outer inset (used when two sections sit side by side).
+    fn build_details_section(&self, compact: bool) -> cosmic::Element<'_, Message> {
+        let mut col = cosmic::iced_widget::column![].spacing(8);
+
+        for element in self.info_block_elements() {
+            col = col.push(padded_row(element, compact));
         }
 
         col.into()
     }
 
-    /// Build the controls section (turbo, governor, EPP, freq sliders).
-    fn build_controls_section(&self) -> cosmic::Element<'_, Message> {
+    /// A dropdown that renders as a native popup surface (avoids the in-window
+    /// menu overflowing the narrow applet popup).
+    fn popup_dropdown<'a, S>(
+        &self,
+        selections: &'a [S],
+        selected: Option<usize>,
+        on_selected: impl Fn(usize) -> Message + Send + Sync + 'static,
+    ) -> cosmic::widget::dropdown::Dropdown<'a, S, Message, Message>
+    where
+        S: AsRef<str> + Clone + Send + Sync + 'static,
+    {
+        cosmic::widget::dropdown::popup_dropdown(
+            selections,
+            selected,
+            on_selected,
+            self.popup.unwrap_or(cosmic::iced::window::Id::NONE),
+            Message::Surface,
+            |m| m,
+        )
+    }
+
+    /// Build the Controls tab (turbo, governor, EPP, freq sliders).
+    ///
+    /// `compact` drops the horizontal row padding so the caller can supply the
+    /// outer inset (used when two sections sit side by side).
+    fn build_controls_section(&self, compact: bool) -> cosmic::Element<'_, Message> {
+        use cosmic::widget::settings;
+
         let mut col = cosmic::iced_widget::column![].spacing(8);
 
         // Turbo boost toggle
-        let turbo_row = cosmic::iced_widget::row![
-            cosmic::widget::text(fl!("turbo-boost")),
-            cosmic::widget::Space::new().width(cosmic::iced::Length::Fill),
-            cosmic::widget::toggler(self.turbo_enabled.unwrap_or(false))
-                .on_toggle(Message::SetTurbo),
-        ];
-        col = col.push(cosmic::applet::padded_control(turbo_row));
+        col = col.push(padded_row(
+            settings::item::builder(fl!("turbo-boost"))
+                .toggler(self.turbo_enabled.unwrap_or(false), Message::SetTurbo)
+                .into(),
+            compact,
+        ));
 
         // Governor dropdown (pretty labels)
         if !self.available_governors.is_empty() {
@@ -740,16 +1137,16 @@ impl CpuFreqApplet {
                 .as_ref()
                 .and_then(|g| self.available_governors.iter().position(|x| x == g));
 
-            let gov_row = cosmic::iced_widget::column![
-                cosmic::widget::text::body(fl!("cpu-governor")),
-                cosmic::widget::dropdown(
-                    &self.governor_labels,
-                    current_idx,
-                    Message::SetGovernor,
-                ),
-            ]
-            .spacing(4);
-            col = col.push(cosmic::applet::padded_control(gov_row));
+            col = col.push(padded_row(
+                settings::item::builder(fl!("cpu-governor"))
+                    .control(self.popup_dropdown(
+                        &self.governor_labels,
+                        current_idx,
+                        Message::SetGovernor,
+                    ))
+                    .into(),
+                compact,
+            ));
         }
 
         // EPP dropdown (pretty labels)
@@ -759,57 +1156,94 @@ impl CpuFreqApplet {
                 .as_ref()
                 .and_then(|e| self.available_epp.iter().position(|x| x == e));
 
-            let epp_row = cosmic::iced_widget::column![
-                cosmic::widget::text::body(fl!("energy-preference")),
-                cosmic::widget::dropdown(&self.epp_labels, current_idx, Message::SetEpp),
-            ]
-            .spacing(4);
-            col = col.push(cosmic::applet::padded_control(epp_row));
+            col = col.push(padded_row(
+                settings::item::builder(fl!("energy-preference"))
+                    .control(self.popup_dropdown(&self.epp_labels, current_idx, Message::SetEpp))
+                    .into(),
+                compact,
+            ));
         }
 
         // Frequency sliders
         if let Some((min_bound, max_bound)) = self.freq_bounds {
             let step = 100.0;
+            let range = max_bound - min_bound;
+            let percent = |v: f64| {
+                if range > 0.0 {
+                    ((v - min_bound) / range * 100.0).clamp(0.0, 100.0)
+                } else {
+                    0.0
+                }
+            };
 
             let display_min = self.preview_min_mhz.or(self.scaling_min_mhz);
             let display_max = self.preview_max_mhz.or(self.scaling_max_mhz);
 
-            if let Some(scaling_min) = display_min {
-                let min_label = if scaling_min >= 1000.0 {
-                    format!("{}: {:.1} GHz", fl!("min-frequency"), scaling_min / 1000.0)
-                } else {
-                    format!("{}: {:.0} MHz", fl!("min-frequency"), scaling_min)
-                };
+            if self.config.show_min_frequency_slider
+                && let Some(scaling_min) = display_min
+            {
                 let min_row = cosmic::iced_widget::column![
-                    cosmic::widget::text::body(min_label),
+                    cosmic::iced_widget::row![
+                        cosmic::widget::text::body(format!(
+                            "{}: {}",
+                            fl!("min-frequency"),
+                            self.format_freq(Some(scaling_min))
+                        )),
+                        cosmic::widget::Space::new().width(cosmic::iced::Length::Fill),
+                        cosmic::widget::text::body(format!("{:.0}%", percent(scaling_min))),
+                    ]
+                    .align_y(cosmic::iced::Alignment::Center),
                     cosmic::widget::slider(min_bound..=max_bound, scaling_min, move |v| {
                         Message::PreviewScalingMin((v / step).round() * step)
                     })
                     .on_release(Message::CommitScalingMin),
                 ]
                 .spacing(4);
-                col = col.push(cosmic::applet::padded_control(min_row));
+                col = col.push(padded_row(min_row.into(), compact));
             }
 
-            if let Some(scaling_max) = display_max {
-                let max_label = if scaling_max >= 1000.0 {
-                    format!("{}: {:.1} GHz", fl!("max-frequency"), scaling_max / 1000.0)
-                } else {
-                    format!("{}: {:.0} MHz", fl!("max-frequency"), scaling_max)
-                };
+            if self.config.show_max_frequency_slider
+                && let Some(scaling_max) = display_max
+            {
                 let max_row = cosmic::iced_widget::column![
-                    cosmic::widget::text::body(max_label),
+                    cosmic::iced_widget::row![
+                        cosmic::widget::text::body(format!(
+                            "{}: {}",
+                            fl!("max-frequency"),
+                            self.format_freq(Some(scaling_max))
+                        )),
+                        cosmic::widget::Space::new().width(cosmic::iced::Length::Fill),
+                        cosmic::widget::text::body(format!("{:.0}%", percent(scaling_max))),
+                    ]
+                    .align_y(cosmic::iced::Alignment::Center),
                     cosmic::widget::slider(min_bound..=max_bound, scaling_max, move |v| {
                         Message::PreviewScalingMax((v / step).round() * step)
                     })
                     .on_release(Message::CommitScalingMax),
                 ]
                 .spacing(4);
-                col = col.push(cosmic::applet::padded_control(max_row));
+                col = col.push(padded_row(max_row.into(), compact));
             }
         }
 
         col.into()
+    }
+}
+
+/// Wrap a row in the standard menu padding, or vertical-only padding when
+/// `compact` (so a caller can supply the horizontal inset for side-by-side
+/// sections).
+fn padded_row<'a>(
+    widget: cosmic::Element<'a, Message>,
+    compact: bool,
+) -> cosmic::Element<'a, Message> {
+    if compact {
+        cosmic::widget::container(widget)
+            .padding([4.0, 0.0])
+            .width(cosmic::iced::Length::Fill)
+            .into()
+    } else {
+        cosmic::applet::padded_control(widget).into()
     }
 }
 
