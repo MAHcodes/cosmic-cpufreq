@@ -2,6 +2,11 @@
 
 A COSMIC applet for inspecting and changing CPU frequency scaling settings on Linux.
 
+> **Note**
+>
+> This is a fork of [skylord123/cosmic-cpufreq](https://github.com/skylord123/cosmic-cpufreq).
+> The changes in this fork were developed with the help of AI.
+
 Features:
 - show current average CPU frequency in the panel (icon and/or text)
 - toggle turbo boost
