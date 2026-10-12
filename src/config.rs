@@ -64,6 +64,19 @@ impl Default for PopupLayout {
     }
 }
 
+/// Unit used when displaying CPU temperature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum TemperatureUnit {
+    Celsius,
+    Fahrenheit,
+}
+
+impl Default for TemperatureUnit {
+    fn default() -> Self {
+        Self::Celsius
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, CosmicConfigEntry)]
 #[version = 1]
 pub(crate) struct CpuFreqConfig {
@@ -83,6 +96,20 @@ pub(crate) struct CpuFreqConfig {
     pub(crate) show_panel_icon: bool,
     /// Whether to show the frequency text on the panel button
     pub(crate) show_panel_text: bool,
+    /// Whether to show the CPU temperature on the panel button
+    pub(crate) show_panel_temperature: bool,
+    /// Whether to show the CPU usage percentage on the panel button
+    pub(crate) show_panel_percentage: bool,
+    /// Whether to show a separator between the panel text items
+    pub(crate) show_panel_separator: bool,
+    /// Character used to separate the panel text items
+    pub(crate) panel_separator: String,
+    /// Unit used when displaying CPU temperature
+    pub(crate) temperature_unit: TemperatureUnit,
+    /// Whether to show the CPU temperature in the Details view
+    pub(crate) show_temperature: bool,
+    /// Whether to show the per-core temperature grid
+    pub(crate) show_per_core_temperature: bool,
     /// Whether to show the per-core frequency grid
     pub(crate) show_per_core_freqs: bool,
     /// Whether to show per-core CPU usage % in the core grid
@@ -114,6 +141,13 @@ impl Default for CpuFreqConfig {
             popup_layout: PopupLayout::default(),
             show_panel_icon: false,
             show_panel_text: true,
+            show_panel_temperature: false,
+            show_panel_percentage: false,
+            show_panel_separator: true,
+            panel_separator: "|".to_string(),
+            temperature_unit: TemperatureUnit::default(),
+            show_temperature: true,
+            show_per_core_temperature: false,
             show_per_core_freqs: true,
             show_per_core_usage: true,
             show_cpu_usage: true,

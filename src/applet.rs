@@ -3,7 +3,7 @@ use std::time::Duration;
 use tracing::{debug, trace};
 
 use crate::{
-    config::{APP_ID, CpuFreqConfig, Flags, FreqDisplayMode, FreqUnit, PopupLayout},
+    config::{APP_ID, CpuFreqConfig, Flags, FreqDisplayMode, FreqUnit, PopupLayout, TemperatureUnit},
     cpu, fl,
 };
 
@@ -20,7 +20,17 @@ pub(crate) fn run() -> cosmic::iced::Result {
 const DEFAULT_POPUP_WIDTH: f32 = 360.0;
 const HORIZONTAL_POPUP_WIDTH: f32 = 600.0;
 /// Fixed width reserved for the panel frequency text so it never changes width.
-const PANEL_TEXT_WIDTH: f32 = 64.0;
+const PANEL_TEXT_WIDTH: f32 = 58.0;
+/// Fixed width reserved for the panel temperature text.
+const PANEL_TEMP_WIDTH: f32 = 40.0;
+/// Fixed width reserved for the panel CPU usage percentage text.
+const PANEL_PERCENT_WIDTH: f32 = 40.0;
+
+/// Stable autosize id for the panel button. Must not change between frames,
+/// otherwise the panel loses track of the button and dismisses the popup.
+static PANEL_BUTTON_ID: std::sync::LazyLock<cosmic::widget::Id> = std::sync::LazyLock::new(|| {
+    cosmic::widget::Id::new("cosmic-cpufreq-panel-button")
+});
 
 struct CpuFreqApplet {
     core: cosmic::app::Core,
@@ -29,6 +39,7 @@ struct CpuFreqApplet {
     config_handler: Option<cosmic::cosmic_config::Config>,
     // Live state
     current_freq_mhz: Option<f64>,
+    cpu_temperature_c: Option<f64>,
     turbo_enabled: Option<bool>,
     current_governor: Option<String>,
     available_governors: Vec<String>,
@@ -53,6 +64,7 @@ struct CpuFreqApplet {
     kernel_version: Option<String>,
     // Per-core and usage (updated only when popup is open)
     per_core_freqs: Vec<(u32, f64)>,
+    per_core_temps: Vec<(u32, f64)>,
     cpu_usage_prev: Option<cpu::CpuUsageSnapshot>,
     cpu_usage_percent: Option<f64>,
     per_core_usage: Vec<f64>,
@@ -61,6 +73,7 @@ struct CpuFreqApplet {
     // Dropdown options stored to satisfy borrow lifetime
     display_mode_options: Vec<String>,
     freq_unit_options: Vec<String>,
+    temperature_unit_options: Vec<String>,
     precision_options: Vec<String>,
     columns_options: Vec<String>,
     layout_options: Vec<String>,
@@ -93,6 +106,13 @@ pub(crate) enum Message {
     SetLayout(usize),
     SetShowPanelIcon(bool),
     SetShowPanelText(bool),
+    SetShowPanelTemperature(bool),
+    SetShowPanelPercentage(bool),
+    SetShowPanelSeparator(bool),
+    PanelSeparatorChanged(String),
+    SetTemperatureUnit(usize),
+    SetShowTemperature(bool),
+    SetShowPerCoreTemperature(bool),
     SetShowPerCoreFreqs(bool),
     SetShowPerCoreUsage(bool),
     SetShowCpuUsage(bool),
@@ -124,6 +144,8 @@ impl cosmic::Application for CpuFreqApplet {
         let scaling_min_mhz = cpu::read_scaling_min_mhz();
         let scaling_max_mhz = cpu::read_scaling_max_mhz();
         let current_freq_mhz = cpu::read_current_frequency_mhz();
+        let cpu_temperature_c = cpu::read_cpu_temperature_c();
+        let per_core_temps = cpu::read_per_cpu_temperatures_c();
 
         let update_interval_input = flags.config.update_interval_ms.to_string();
 
@@ -146,6 +168,7 @@ impl cosmic::Application for CpuFreqApplet {
             config: flags.config,
             config_handler: flags.config_handler,
             current_freq_mhz,
+            cpu_temperature_c,
             turbo_enabled,
             current_governor,
             available_governors,
@@ -165,6 +188,7 @@ impl cosmic::Application for CpuFreqApplet {
             os_name,
             kernel_version,
             per_core_freqs: Vec::new(),
+            per_core_temps,
             cpu_usage_prev: None,
             cpu_usage_percent: None,
             per_core_usage: Vec::new(),
@@ -176,6 +200,7 @@ impl cosmic::Application for CpuFreqApplet {
                 fl!("display-maximum"),
             ],
             freq_unit_options: vec![fl!("unit-auto"), fl!("unit-ghz"), fl!("unit-mhz")],
+            temperature_unit_options: vec![fl!("temp-celsius"), fl!("temp-fahrenheit")],
             precision_options: (0..=3).map(|p| p.to_string()).collect(),
             columns_options: ["2", "3", "4", "6", "8"]
                 .iter()
@@ -245,6 +270,8 @@ impl cosmic::Application for CpuFreqApplet {
                         FreqDisplayMode::Maximum => freqs.reduce(f64::max),
                     }
                 };
+                self.cpu_temperature_c = cpu::read_cpu_temperature_c();
+                self.per_core_temps = cpu::read_per_cpu_temperatures_c();
                 let system_turbo = cpu::read_turbo_enabled();
                 // If turbo was changed externally, restore our saved setting
                 if self.config.restore_settings_on_start
@@ -307,6 +334,8 @@ impl cosmic::Application for CpuFreqApplet {
                 let max_freq = cpu::read_effective_max_frequency_mhz();
                 self.freq_bounds = min_freq.zip(max_freq);
                 self.per_core_freqs = cpu::read_per_core_frequencies_mhz();
+                self.cpu_temperature_c = cpu::read_cpu_temperature_c();
+                self.per_core_temps = cpu::read_per_cpu_temperatures_c();
                 self.cpu_usage_prev = cpu::read_cpu_usage_snapshot();
                 self.cpu_usage_percent = None; // need two snapshots
                 if let Some((used, total)) = cpu::read_memory_usage() {
@@ -491,6 +520,67 @@ impl cosmic::Application for CpuFreqApplet {
                     tracing::error!("Failed to save panel text setting: {error}");
                 }
             }
+            Message::SetShowPanelTemperature(enabled) => {
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) = self
+                        .config
+                        .set_show_panel_temperature(handler, enabled)
+                {
+                    tracing::error!("Failed to save panel temperature setting: {error}");
+                }
+            }
+            Message::SetShowPanelPercentage(enabled) => {
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) = self
+                        .config
+                        .set_show_panel_percentage(handler, enabled)
+                {
+                    tracing::error!("Failed to save panel percentage setting: {error}");
+                }
+            }
+            Message::SetShowPanelSeparator(enabled) => {
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) = self
+                        .config
+                        .set_show_panel_separator(handler, enabled)
+                {
+                    tracing::error!("Failed to save panel separator setting: {error}");
+                }
+            }
+            Message::PanelSeparatorChanged(value) => {
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) = self.config.set_panel_separator(handler, value)
+                {
+                    tracing::error!("Failed to save panel separator: {error}");
+                }
+            }
+            Message::SetTemperatureUnit(idx) => {
+                let unit = match idx {
+                    1 => TemperatureUnit::Fahrenheit,
+                    _ => TemperatureUnit::Celsius,
+                };
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) = self.config.set_temperature_unit(handler, unit)
+                {
+                    tracing::error!("Failed to save temperature unit: {error}");
+                }
+            }
+            Message::SetShowTemperature(enabled) => {
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) = self.config.set_show_temperature(handler, enabled)
+                {
+                    tracing::error!("Failed to save temperature setting: {error}");
+                }
+            }
+            Message::SetShowPerCoreTemperature(enabled) => {
+                if let Some(handler) = &self.config_handler
+                    && let Err(error) = self
+                        .config
+                        .set_show_per_core_temperature(handler, enabled)
+                {
+                    tracing::error!("Failed to save per-core temperature setting: {error}");
+                }
+            }
             Message::SetShowPerCoreFreqs(enabled) => {
                 if let Some(handler) = &self.config_handler
                     && let Err(error) = self.config.set_show_per_core_freqs(handler, enabled)
@@ -553,37 +643,88 @@ impl cosmic::Application for CpuFreqApplet {
     }
 
     fn view(&self) -> cosmic::Element<'_, Message> {
+        // Match the standard panel applet button height and padding so this
+        // button lines up with the other applets on the panel.
+        let suggested = self.core.applet.suggested_size(true);
+        let (major, minor) = self.core.applet.suggested_padding(true);
+        let (horizontal_padding, vertical_padding) = if self.core.applet.is_horizontal() {
+            (major, minor)
+        } else {
+            (minor, major)
+        };
+        let button_height = suggested.1 as f32 + 2.0 * f32::from(vertical_padding);
+
         // Fixed width so the panel button does not resize as the text changes.
         let freq_text = cosmic::widget::container(
             cosmic::widget::text(self.format_freq(self.current_freq_mhz)).size(12),
         )
         .center_x(cosmic::iced::Length::Fixed(PANEL_TEXT_WIDTH));
 
+        let temp_text = cosmic::widget::container(
+            cosmic::widget::text(self.format_temp(self.cpu_temperature_c)).size(12),
+        )
+        .center_x(cosmic::iced::Length::Fixed(PANEL_TEMP_WIDTH));
+
+        let percent_text = cosmic::widget::container(
+            cosmic::widget::text(
+                self.cpu_usage_percent
+                    .map(|p| format!("{p:.0}%"))
+                    .unwrap_or_else(|| "--".to_string()),
+            )
+            .size(12),
+        )
+        .center_x(cosmic::iced::Length::Fixed(PANEL_PERCENT_WIDTH));
+
         let show_icon = self.config.show_panel_icon;
         let show_text = self.config.show_panel_text;
+        let show_temp = self.config.show_panel_temperature;
+        let show_percent = self.config.show_panel_percentage;
+        let show_separator = self.config.show_panel_separator;
+        let separator = self.config.panel_separator.clone();
 
-        let content: cosmic::Element<'_, Message> = if show_icon && show_text {
-            cosmic::iced_widget::row![
-                cosmic::widget::icon::from_name("utilities-system-monitor-symbolic").size(16),
-                freq_text,
-            ]
-            .spacing(6)
-            .align_y(cosmic::iced::Alignment::Center)
-            .into()
-        } else if show_icon {
-            cosmic::widget::icon::from_name("utilities-system-monitor-symbolic")
-                .size(16)
-                .into()
-        } else {
-            // Fall back to text even when disabled so the button is not empty
-            freq_text.into()
-        };
+        // Fall back to text even when everything is disabled so the button is not empty
+        let content: cosmic::Element<'_, Message> =
+            if show_icon || show_text || show_temp || show_percent {
+                let mut items: Vec<cosmic::Element<'_, Message>> = Vec::new();
+                if show_text {
+                    items.push(freq_text.into());
+                }
+                if show_temp {
+                    items.push(temp_text.into());
+                }
+                if show_percent {
+                    items.push(percent_text.into());
+                }
+
+                let mut row = cosmic::iced_widget::row![]
+                    .spacing(4)
+                    .align_y(cosmic::iced::Alignment::Center);
+                if show_icon {
+                    row = row.push(
+                        cosmic::widget::icon::from_name("utilities-system-monitor-symbolic")
+                            .size(suggested.0),
+                    );
+                }
+                for (index, item) in items.into_iter().enumerate() {
+                    if index > 0 && show_separator {
+                        row = row.push(cosmic::widget::text(separator.clone()).size(12));
+                    }
+                    row = row.push(item);
+                }
+                row.into()
+            } else {
+                freq_text.into()
+            };
+
+        let content = cosmic::widget::container(content)
+            .center_y(cosmic::iced::Length::Fixed(button_height));
 
         let button = cosmic::widget::button::custom(content)
             .class(cosmic::theme::Button::AppletIcon)
+            .padding([0, horizontal_padding])
             .on_press_down(Message::ToggleWindow);
 
-        cosmic::widget::autosize::autosize(button, cosmic::widget::Id::unique()).into()
+        cosmic::widget::autosize::autosize(button, PANEL_BUTTON_ID.clone()).into()
     }
 
     fn view_window(&self, _id: cosmic::iced::window::Id) -> cosmic::Element<'_, Message> {
@@ -625,21 +766,14 @@ impl CpuFreqApplet {
     fn tabbed_view(&self) -> cosmic::Element<'_, Message> {
         let mut col = cosmic::iced_widget::column![].spacing(8);
 
-        // Header: current frequency prominent, settings cog on the right
-        let freq_col = cosmic::iced_widget::column![
-            cosmic::widget::text::caption(fl!("frequency")),
-            cosmic::widget::text::title3(self.format_freq(self.current_freq_mhz)),
-        ]
-        .spacing(2);
         let header = cosmic::iced_widget::row![
-            freq_col,
+            cosmic::widget::text::title4(fl!("applet-title")),
             cosmic::widget::Space::new().width(cosmic::iced::Length::Fill),
             self.settings_cog(),
         ]
+        .spacing(8)
         .align_y(cosmic::iced::Alignment::Center);
         col = col.push(cosmic::applet::padded_control(header));
-
-        // Tab switcher
         let tabs = cosmic::widget::segmented_control::horizontal(&self.main_tab_model)
             .on_activate(Message::MainTabActivated);
         col = col.push(cosmic::applet::padded_control(tabs));
@@ -663,17 +797,12 @@ impl CpuFreqApplet {
     fn single_view(&self) -> cosmic::Element<'_, Message> {
         let mut col = cosmic::iced_widget::column![].spacing(8);
 
-        // Header: current frequency, settings cog on the right
-        let freq_col = cosmic::iced_widget::column![
-            cosmic::widget::text::caption(fl!("frequency")),
-            cosmic::widget::text::title3(self.format_freq(self.current_freq_mhz)),
-        ]
-        .spacing(2);
         let header = cosmic::iced_widget::row![
-            freq_col,
+            cosmic::widget::text::title4(fl!("applet-title")),
             cosmic::widget::Space::new().width(cosmic::iced::Length::Fill),
             self.settings_cog(),
         ]
+        .spacing(8)
         .align_y(cosmic::iced::Alignment::Center);
         col = col.push(cosmic::applet::padded_control(header));
 
@@ -702,7 +831,7 @@ impl CpuFreqApplet {
                         left: 0.0,
                     });
                 let body = cosmic::iced_widget::row![info_section, controls_section]
-                    .spacing(16)
+                    .spacing(24)
                     .align_y(cosmic::iced::Alignment::Start);
                 col = col.push(body);
             }
@@ -764,6 +893,10 @@ impl CpuFreqApplet {
             FreqUnit::Megahertz => Some(2),
         };
         let precision_idx = Some(self.config.freq_precision.clamp(0, 3) as usize);
+        let temperature_unit_idx = match self.config.temperature_unit {
+            TemperatureUnit::Celsius => Some(0),
+            TemperatureUnit::Fahrenheit => Some(1),
+        };
         let layout_idx = match self.config.popup_layout {
             PopupLayout::Tabbed => Some(0),
             PopupLayout::Horizontal => Some(1),
@@ -788,6 +921,18 @@ impl CpuFreqApplet {
                     .toggler(self.config.show_panel_text, Message::SetShowPanelText),
             )
             .add(
+                settings::item::builder(fl!("show-panel-temperature")).toggler(
+                    self.config.show_panel_temperature,
+                    Message::SetShowPanelTemperature,
+                ),
+            )
+            .add(
+                settings::item::builder(fl!("show-panel-percentage")).toggler(
+                    self.config.show_panel_percentage,
+                    Message::SetShowPanelPercentage,
+                ),
+            )
+            .add(
                 settings::item::builder(fl!("display-mode")).control(self.popup_dropdown(
                     &self.display_mode_options,
                     display_mode_idx,
@@ -809,6 +954,22 @@ impl CpuFreqApplet {
                 )),
             )
             .add(
+                settings::item::builder(fl!("show-panel-separator")).toggler(
+                    self.config.show_panel_separator,
+                    Message::SetShowPanelSeparator,
+                ),
+            )
+            .add(
+                settings::item::builder(fl!("panel-separator")).control(
+                    cosmic::widget::text_input("|", &self.config.panel_separator)
+                        .on_input(Message::PanelSeparatorChanged)
+                        .width(cosmic::iced::Length::Fixed(120.0)),
+                ),
+            );
+
+        let popup = settings::section()
+            .title(fl!("popup-section"))
+            .add(
                 settings::item::builder(fl!("popup-layout")).control(self.popup_dropdown(
                     &self.layout_options,
                     layout_idx,
@@ -818,6 +979,19 @@ impl CpuFreqApplet {
 
         let details = settings::section()
             .title(fl!("details-section"))
+            .add(
+                settings::item::builder(fl!("temperature-unit")).control(self.popup_dropdown(
+                    &self.temperature_unit_options,
+                    temperature_unit_idx,
+                    Message::SetTemperatureUnit,
+                )),
+            )
+            .add(
+                settings::item::builder(fl!("show-per-core-temperature")).toggler(
+                    self.config.show_per_core_temperature,
+                    Message::SetShowPerCoreTemperature,
+                ),
+            )
             .add(settings::item::builder(fl!("show-per-core-freqs")).toggler(
                 self.config.show_per_core_freqs,
                 Message::SetShowPerCoreFreqs,
@@ -840,7 +1014,11 @@ impl CpuFreqApplet {
             .add(
                 settings::item::builder(fl!("show-memory-usage"))
                     .toggler(self.config.show_memory_usage, Message::SetShowMemoryUsage),
-            );
+            )
+            .add(settings::item::builder(fl!("show-temperature")).toggler(
+                self.config.show_temperature,
+                Message::SetShowTemperature,
+            ));
 
         let controls = settings::section()
             .title(fl!("controls-section"))
@@ -876,6 +1054,7 @@ impl CpuFreqApplet {
 
         settings::view_column(vec![
             panel.into(),
+            popup.into(),
             details.into(),
             controls.into(),
             behavior.into(),
@@ -920,6 +1099,17 @@ impl CpuFreqApplet {
     fn format_ghz(mhz: f64, precision: u32) -> String {
         let prec = precision.min(3) as usize;
         format!("{:.prec$} GHz", mhz / 1000.0, prec = prec)
+    }
+
+    /// Format a temperature value according to the configured unit.
+    fn format_temp(&self, celsius: Option<f64>) -> String {
+        let Some(c) = celsius else {
+            return "--".to_string();
+        };
+        match self.config.temperature_unit {
+            TemperatureUnit::Celsius => format!("{c:.0}°C"),
+            TemperatureUnit::Fahrenheit => format!("{:.0}°F", c * 9.0 / 5.0 + 32.0),
+        }
     }
 
     /// Restore saved turbo setting if system state differs from config.
@@ -999,30 +1189,49 @@ impl CpuFreqApplet {
     fn info_block_elements(&self) -> Vec<cosmic::Element<'_, Message>> {
         let mut elements = Vec::new();
 
-        // Per-core frequency grid
-        if self.config.show_per_core_freqs && !self.per_core_freqs.is_empty() {
+        // Per-core grid (frequency, usage and temperature per core)
+        let show_cores = self.config.show_per_core_freqs
+            || self.config.show_per_core_usage
+            || self.config.show_per_core_temperature;
+        if show_cores && !self.per_core_freqs.is_empty() {
             let cols = self.config.per_core_columns.clamp(1, 16) as usize;
+            let temps: std::collections::HashMap<u32, f64> =
+                self.per_core_temps.iter().copied().collect();
             let mut grid_col = cosmic::iced_widget::column![].spacing(6);
 
             for (chunk_idx, chunk) in self.per_core_freqs.chunks(cols).enumerate() {
                 let mut row = cosmic::iced_widget::row![].spacing(8);
                 for (i, (id, mhz)) in chunk.iter().enumerate() {
-                    let freq_str = self.format_freq(Some(*mhz));
-                    let mut cell = cosmic::iced_widget::column![
-                        cosmic::widget::text(format!("CPU{id}")).size(11),
-                        cosmic::widget::text(freq_str).size(13),
-                    ]
+                    let mut cell = cosmic::iced_widget::column![cosmic::widget::text(format!(
+                        "CPU{id}"
+                    ))
+                    .size(11)]
+                    .spacing(1)
                     .align_x(cosmic::iced::Alignment::Center)
                     .width(cosmic::iced::Length::FillPortion(1));
 
+                    if self.config.show_per_core_freqs {
+                        cell = cell
+                            .push(cosmic::widget::text(self.format_freq(Some(*mhz))).size(13));
+                    }
+
+                    let mut details: Vec<String> = Vec::new();
+                    if self.config.show_per_core_temperature
+                        && let Some(temp) = temps.get(id)
+                    {
+                        details.push(self.format_temp(Some(*temp)));
+                    }
                     if self.config.show_per_core_usage {
                         let core_idx = chunk_idx * cols + i;
-                        let usage_str = self
+                        let usage = self
                             .per_core_usage
                             .get(core_idx)
                             .map(|pct| format!("{pct:.0}%"))
                             .unwrap_or_else(|| "--".to_string());
-                        cell = cell.push(cosmic::widget::text(usage_str).size(10));
+                        details.push(usage);
+                    }
+                    if !details.is_empty() {
+                        cell = cell.push(cosmic::widget::text(details.join(" · ")).size(10));
                     }
 
                     row = row.push(cell);
@@ -1073,6 +1282,25 @@ impl CpuFreqApplet {
             ]
             .spacing(4);
             elements.push(bar_row.into());
+        }
+
+        // CPU package temperature bar
+        if self.config.show_temperature {
+            let (value, label) = match self.cpu_temperature_c {
+                Some(c) => (c, self.format_temp(Some(c))),
+                None => (0.0, "--".to_string()),
+            };
+            let temp_bar = cosmic::iced_widget::column![
+                cosmic::iced_widget::row![
+                    cosmic::widget::text::body(fl!("temperature")),
+                    cosmic::widget::Space::new().width(cosmic::iced::Length::Fill),
+                    cosmic::widget::text::body(label),
+                ]
+                .align_y(cosmic::iced::Alignment::Center),
+                cosmic::widget::progress_bar(0.0..=100.0, value as f32),
+            ]
+            .spacing(4);
+            elements.push(temp_bar.into());
         }
 
         elements

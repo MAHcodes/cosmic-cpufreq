@@ -296,6 +296,195 @@ pub(crate) fn read_cpu_usage_snapshot() -> Option<CpuUsageSnapshot> {
     })
 }
 
+/// CPU sensor names exposed by common hwmon drivers, in priority order.
+const CPU_SENSOR_NAMES: &[&str] = &["coretemp", "k10temp", "zenpower", "cpu_thermal"];
+/// Fallback ACPI thermal zone (used only when no CPU-specific sensor exists).
+const ACPI_SENSOR_NAME: &str = "acpitz";
+
+/// Read the current CPU temperature in degrees Celsius.
+///
+/// Prefers a package-level reading (e.g. `Package id 0`, `Tctl`, `Tdie`) and
+/// falls back to the hottest individual sensor.
+pub(crate) fn read_cpu_temperature_c() -> Option<f64> {
+    let hwmon = Path::new("/sys/class/hwmon");
+    let entries = fs::read_dir(hwmon).ok()?;
+
+    let mut cpu_reading: Option<f64> = None;
+    let mut acpi_reading: Option<f64> = None;
+
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let Ok(name) = fs::read_to_string(dir.join("name")) else {
+            continue;
+        };
+        let name = name.trim().to_lowercase();
+
+        let is_cpu = CPU_SENSOR_NAMES.iter().any(|n| name == *n);
+        let is_acpi = name.starts_with(ACPI_SENSOR_NAME);
+        if !is_cpu && !is_acpi {
+            continue;
+        }
+
+        let reading = read_hwmon_temperature(&dir);
+        if is_cpu {
+            if let Some(r) = reading {
+                cpu_reading = Some(cpu_reading.map_or(r, |m: f64| m.max(r)));
+            }
+        } else if let Some(r) = reading {
+            acpi_reading = Some(acpi_reading.map_or(r, |m: f64| m.max(r)));
+        }
+    }
+
+    cpu_reading.or(acpi_reading)
+}
+
+/// Scan a hwmon directory for `tempN_input` values, preferring a package label.
+fn read_hwmon_temperature(dir: &Path) -> Option<f64> {
+    let files = fs::read_dir(dir).ok()?;
+    let mut package: Option<f64> = None;
+    let mut max_temp: Option<f64> = None;
+
+    for file in files.flatten() {
+        let file_name = file.file_name();
+        let file_name = file_name.to_string_lossy();
+        let Some(prefix) = file_name.strip_suffix("_input") else {
+            continue;
+        };
+        if !prefix.starts_with("temp") {
+            continue;
+        }
+
+        let Ok(raw) = fs::read_to_string(file.path()) else {
+            continue;
+        };
+        let Ok(milli) = raw.trim().parse::<f64>() else {
+            continue;
+        };
+        let celsius = milli / 1000.0;
+
+        max_temp = Some(max_temp.map_or(celsius, |m: f64| m.max(celsius)));
+
+        let label = fs::read_to_string(dir.join(format!("{prefix}_label"))).unwrap_or_default();
+        let label = label.trim();
+        if label.eq_ignore_ascii_case("Package id 0")
+            || label.eq_ignore_ascii_case("Tctl")
+            || label.eq_ignore_ascii_case("Tdie")
+        {
+            package = Some(celsius);
+        }
+    }
+
+    package.or(max_temp)
+}
+
+/// Read per-core CPU temperatures in Celsius.
+///
+/// Keyed by the core number parsed from sensor labels such as `Core 0` or
+/// `CPU 3`, sorted by that number. Returns an empty list when the platform only
+/// exposes a package-level sensor (e.g. `k10temp`).
+pub(crate) fn read_per_core_temperatures_c() -> Vec<(u32, f64)> {
+    let mut results: Vec<(u32, f64)> = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/class/hwmon") else {
+        return results;
+    };
+
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let Ok(name) = fs::read_to_string(dir.join("name")) else {
+            continue;
+        };
+        let name = name.trim().to_lowercase();
+        if !CPU_SENSOR_NAMES.iter().any(|n| name == *n) {
+            continue;
+        }
+
+        let Ok(files) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let file_name = file.file_name();
+            let file_name = file_name.to_string_lossy();
+            let Some(prefix) = file_name.strip_suffix("_input") else {
+                continue;
+            };
+            if !prefix.starts_with("temp") {
+                continue;
+            }
+
+            let Ok(label) = fs::read_to_string(dir.join(format!("{prefix}_label"))) else {
+                continue;
+            };
+            let Some(core) = parse_core_label(label.trim()) else {
+                continue;
+            };
+
+            let Ok(raw) = fs::read_to_string(file.path()) else {
+                continue;
+            };
+            let Ok(milli) = raw.trim().parse::<f64>() else {
+                continue;
+            };
+            results.push((core, milli / 1000.0));
+        }
+    }
+
+    results.sort_by_key(|(core, _)| *core);
+    results
+}
+
+/// Parse a hwmon label like `Core 3` or `CPU 3` into its index.
+fn parse_core_label(label: &str) -> Option<u32> {
+    for prefix in ["Core", "CPU"] {
+        if let Some(rest) = label.strip_prefix(prefix) {
+            return rest.trim().parse::<u32>().ok();
+        }
+    }
+    None
+}
+
+/// Read CPU temperature per logical CPU, in Celsius.
+///
+/// Maps per-core sensors (e.g. `coretemp`'s `Core N`) onto logical CPUs using
+/// each CPU's topology `core_id`, so SMT siblings report their shared physical
+/// core's temperature. Falls back to the raw sensor labels when topology
+/// information is unavailable.
+pub(crate) fn read_per_cpu_temperatures_c() -> Vec<(u32, f64)> {
+    let core_temps = read_per_core_temperatures_c();
+    if core_temps.is_empty() {
+        return core_temps;
+    }
+    let temps_by_core: std::collections::HashMap<u32, f64> =
+        core_temps.iter().copied().collect();
+
+    let mut results = Vec::new();
+    let mut used_topology = false;
+    if let Ok(entries) = fs::read_dir(CPUROOT) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(id_str) = name.strip_prefix("cpu") else {
+                continue;
+            };
+            let Ok(id) = id_str.parse::<u32>() else {
+                continue;
+            };
+            if let Ok(val) = fs::read_to_string(entry.path().join("topology/core_id"))
+                && let Ok(core_id) = val.trim().parse::<u32>()
+                && let Some(&temp) = temps_by_core.get(&core_id)
+            {
+                results.push((id, temp));
+                used_topology = true;
+            }
+        }
+    }
+
+    if !used_topology {
+        return core_temps;
+    }
+    results.sort_by_key(|(id, _)| *id);
+    results
+}
+
 /// Read memory usage: returns (used_kb, total_kb).
 pub(crate) fn read_memory_usage() -> Option<(u64, u64)> {
     let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
